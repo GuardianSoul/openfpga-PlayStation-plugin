@@ -3,11 +3,10 @@
 A [Pocket plugin](https://github.com/openfpga-library/pocket-plugin) for
 Pocket Sync and pupdate. It makes the game files (`.json`) for the
 [PlayStation core](https://github.com/GuardianSoul/openfpga-PlayStation) on
-the SD card, the same way the core's `make_pocket_instances.py` script and
-its SD card helper page do:
+the SD card, the same way the core's `make_pocket_instances.py` script does:
 
 - one entry per multi-disc game, with every disc in it (switch discs in
-  *Core Settings → Disc*) and one shared memory card,
+  *Core Settings → Swap Discs*) and one shared memory card,
   `Saves/playstation/common/<game>.sav`, started from the newest per-disc card;
 - for cores from 0.5.3, which read the `.cue` themselves, game files that
   name only each disc's cue (the core finds the tracks, the other discs and
@@ -43,8 +42,11 @@ replace them, or skip them. A full SD card corrupts easily, so:
 
 ```
 rustup target add wasm32-wasip1
-cargo build --release          # target/wasm32-wasip1/release/plugin.wasm
+scripts/build.sh               # target/wasm32-wasip1/release/plugin.wasm
 ```
+
+`scripts/build.sh` is `cargo build --release --locked` with the build
+machine's folders removed from the paths Rust keeps in the binary.
 
 `host/run_plugin.py` (needs `pip install extism`) runs the plugin headless
 on any folder:

@@ -98,7 +98,7 @@ fn run(core: &str, mode: Option<Mode>) -> PluginMessage {
                 println("Done. Start a game from its .json in the core's file list.");
             }
             if summary.shared > 0 {
-                println("Multi-disc games: change discs in Core Settings > Disc.");
+                println("Multi-disc games: change discs in Core Settings > Swap Discs.");
             }
         }
         Err(error) => println(&format!("Stopped: {error}")),

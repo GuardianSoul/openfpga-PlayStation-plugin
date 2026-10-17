@@ -12,7 +12,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup target add wasm32-wasip1
-      - run: cargo build --release --locked
+      - run: scripts/build.sh
       - run: cp target/wasm32-wasip1/release/plugin.wasm plugin.wasm
       - run: gh release upload "$TAG" plugin.wasm plugin.json --clobber
         env:
