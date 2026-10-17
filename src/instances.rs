@@ -884,7 +884,8 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
         if reason.is_none() && cue_reader {
             // disc 1 boots from its slots, the rest by path
             track_count = files.iter().map(|f| f.1.len()).sum();
-            if files.len() > CUE_FILE_SLOTS {
+            if files.len() > CUE_FILE_SLOTS.min(max_tracks) {
+                // only slots the core declares (101-104 from 0.5.3)
                 files = vec![];
             }
         }
