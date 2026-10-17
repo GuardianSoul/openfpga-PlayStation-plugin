@@ -211,6 +211,19 @@ fn write_parts(path: &Path, reserve: Option<u64>, parts: &mut dyn FnMut(&mut dyn
     }
 }
 
+/// Remove what a run that was stopped part-way (closed, card pulled, power
+/// lost) can leave behind: unfinished .part files under the plugin's folders
+/// and the space check. Real files are only ever replaced by a finished,
+/// verified .part, so these are never needed. Returns how many went.
+pub fn clean_leftovers(card: &Path, platform: &str) -> usize {
+    const OURS: [&str; 5] = [".bin.part", ".cue.part", ".trk.part", ".json.part", ".sav.part"];
+    let mut found = walk(&card.join("Assets").join(platform), &|n| OURS.iter().any(|e| n.ends_with(e)));
+    found.extend(walk(&card.join("Saves").join(platform), &|n| OURS.iter().any(|e| n.ends_with(e))));
+    let check = card.join(".psx-space-check");
+    if check.is_file() { found.push(check); }
+    found.iter().filter(|f| fs::remove_file(f).is_ok()).count()
+}
+
 fn write_bytes(path: &Path, data: &[u8]) -> io::Result<()> {
     write_parts(path, None, &mut |out| out.write_all(data))
 }
@@ -954,7 +967,7 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
                 let _ = fs::remove_file(out.join(format!("{s}.json")));
             }
         }
-        log(&format!("wrote {name}.json ({} discs)", numbers.len()));
+        log(&format!("wrote {name}.json ({} disc{})", numbers.len(), if numbers.len() > 1 { "s" } else { "" }));
         written += 1;
     }
     if written > 0 {

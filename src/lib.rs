@@ -86,6 +86,11 @@ fn run(core: &str, mode: Option<Mode>) -> PluginMessage {
         println(&format!("{core} is no longer on the SD card."));
         return PluginMessage::Exit;
     };
+    convert::resume(card, &mut |line| println(line));
+    let left = instances::clean_leftovers(card, &platform);
+    if left > 0 {
+        println(&format!("Removed {left} unfinished file(s) from an earlier run that was stopped part-way."));
+    }
     if let Some(mode) = mode {
         let jobs = convert::plan(card, core, &platform);
         println(&format!("Converting {} disc(s) in Assets/{platform}/common ...", jobs.len()));

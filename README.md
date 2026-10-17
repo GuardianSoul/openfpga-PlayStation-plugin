@@ -36,7 +36,11 @@ replace them, or skip them. A full SD card corrupts easily, so:
 - with *replace*, a disc that doesn't fit next to its originals is converted
   in the plugin's own folder on the computer first, then the originals are
   removed and the new files copied over. If that copy fails, the converted
-  files stay on the computer (`PlayStation conversions/<game>`).
+  files stay on the computer (`PlayStation conversions/<game>`);
+- if a run is stopped part-way (the updater closed, the card pulled, power
+  lost), the next run first finishes any copy that was waiting on the
+  computer, then removes unfinished `.part` files. Nothing under its real
+  name is ever half-written.
 
 ## Build
 

@@ -199,13 +199,46 @@ fn replace_originals(job: &Job, log: &mut dyn FnMut(&str)) -> Result<(), String>
     Ok(())
 }
 
+/// The journal of a conversion made on the computer, in its work folder
+/// next to files/. It is written once the new files are complete, before
+/// anything on the card changes, so a run that stops part-way (closed, card
+/// pulled, power lost) is finished by the next one (resume). Paths are below
+/// the card.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Journal {
+    /// The original, as reported.
+    shown: String,
+    /// Where files/ goes on the card.
+    dest: String,
+    /// Originals to remove first (the room the copy needs).
+    remove: Vec<String>,
+    /// Afterwards: files to write (a joined disc's new cue) and to remove.
+    write: Vec<(String, String)>,
+    unlink: Vec<String>,
+}
+
+const JOURNAL: &str = "journal.json";
+
+/// Tests stop the plugin at a named step (config test_stop_at) to check
+/// that the next run finishes the job.
+fn test_stop(step: &str) {
+    if extism_pdk::config::get("test_stop_at").ok().flatten().as_deref() == Some(step) {
+        panic!("stopped at {step} (test)");
+    }
+}
+
 /// Convert in the computer's folder, then swap the originals on the card for
 /// the new files.
 fn through_computer(card: &Path, job: &Job, temp: &Path, log: &mut dyn FnMut(&str)) -> Result<PathBuf, String> {
     let work = temp.join(TEMP_FOLDER).join(stem(&name_of(Path::new(&job.shown))));
-    let _ = fs::remove_dir_all(&work);
+    if work.join(JOURNAL).exists() {
+        // A ready conversion that resume could not finish: never overwrite it.
+        return Err(format!("an earlier conversion is still waiting to be copied back, in the plugin's folder under \"{TEMP_FOLDER}/{}\"", name_of(&work)));
+    }
+    let _ = fs::remove_dir_all(&work); // unfinished: its originals are still on the card
     log("  the SD card is short of space: converting on the computer first");
-    let made = produce(job, &work, log).inspect_err(|_| {
+    let files_dir = work.join("files");
+    let made = produce(job, &files_dir, log).inspect_err(|_| {
         let _ = fs::remove_dir_all(&work);
     })?;
     // After the originals go, the new files must fit with RESERVE to spare.
@@ -214,44 +247,128 @@ fn through_computer(card: &Path, job: &Job, temp: &Path, log: &mut dyn FnMut(&st
         let _ = fs::remove_dir_all(&work);
         return Err(no_space(extra).to_string());
     }
-    let dest = card_dest(job).to_path_buf();
-    let files: Vec<PathBuf> = walk(&work, &|_| true);
-    let copy_back = || -> Result<(), String> {
-        for file in &files {
-            let target = dest.join(rel(file, &work));
-            let bytes = size(file).unwrap_or(0);
-            write_parts(&target, Some(bytes), &mut |w| copy_range(file, 0, bytes, w)).map_err(reason)?;
-        }
-        Ok(())
-    };
-    // Originals first: that is the room the copy needs.
-    let gone: Vec<PathBuf> = match &job.kind {
-        Kind::Chd { chd, .. } => vec![chd.clone()],
-        Kind::Split { bin, .. } => vec![bin.clone()],
-        Kind::Join { sources, image, .. } => sources.iter().filter(|s| *s != image).cloned().collect(),
-    };
-    for path in &gone {
-        fs::remove_file(path).map_err(|e| format!("{}: {e}", name_of(path)))?;
-    }
-    if let Err(e) = copy_back() {
-        return Err(format!(
-            "copying back to the SD card failed ({e}); the original is removed and the converted files are kept on \
-             the computer, in the plugin's folder under \"{TEMP_FOLDER}/{}\"",
-            name_of(&work)
-        ));
-    }
+    let on_card = |p: &Path| rel(p, card);
+    let mut journal = Journal { shown: job.shown.clone(), dest: on_card(card_dest(job)), remove: vec![], write: vec![], unlink: vec![] };
     match &job.kind {
-        Kind::Join { cue, files, tracks, image, .. } => {
-            write_bytes(cue, joined_cue(&name_of(image), files, tracks).as_bytes()).map_err(reason)?;
+        Kind::Chd { chd, .. } => journal.remove.push(on_card(chd)),
+        Kind::Split { cue, bin, .. } => {
+            journal.remove.push(on_card(bin));
+            journal.unlink.push(on_card(cue));
         }
-        Kind::Split { cue, .. } => {
-            let _ = fs::remove_file(cue);
+        Kind::Join { cue, files, sources, tracks, image } => {
+            journal.remove.extend(sources.iter().filter(|s| *s != image).map(|s| on_card(s)));
+            journal.write.push((on_card(cue), joined_cue(&name_of(image), files, tracks)));
         }
-        Kind::Chd { .. } => {}
     }
-    let _ = fs::remove_dir_all(&work);
-    log(&format!("  removed the original {}", job.shown));
-    Ok(dest.join(rel(&made, &work)))
+    let text = serde_json::to_string_pretty(&journal).map_err(|e| e.to_string())?;
+    write_bytes(&work.join(JOURNAL), text.as_bytes()).map_err(reason)?;
+    test_stop("journal");
+    finish(card, &work, &journal, log)?;
+    Ok(card.join(&journal.dest).join(rel(&made, &files_dir)))
+}
+
+/// Carry out a journal: remove the originals, copy files/ to the card
+/// (each file written, synced and read back), apply the cue changes, then
+/// drop the work folder. Every step can be repeated, so a stopped run is
+/// simply finished again.
+fn finish(card: &Path, work: &Path, journal: &Journal, log: &mut dyn FnMut(&str)) -> Result<(), String> {
+    let files_dir = work.join("files");
+    for path in &journal.remove {
+        let path = card.join(path);
+        if path.exists() {
+            fs::remove_file(&path).map_err(|e| format!("{}: {e}", name_of(&path)))?;
+        }
+        test_stop("remove");
+    }
+    let dest = card.join(&journal.dest);
+    for file in walk(&files_dir, &|_| true) {
+        let target = dest.join(rel(&file, &files_dir));
+        let bytes = size(&file).unwrap_or(0);
+        if same_file(&file, &target) {
+            continue; // copied before the run stopped
+        }
+        write_parts(&target, Some(bytes), &mut |w| copy_range(&file, 0, bytes, w)).map_err(|e| {
+            format!(
+                "copying back to the SD card failed ({}); the original is removed and the converted files are kept on \
+                 the computer, in the plugin's folder under \"{TEMP_FOLDER}/{}\". The next run copies them back.",
+                reason(e),
+                name_of(work)
+            )
+        })?;
+        test_stop("copied");
+    }
+    for (path, text) in &journal.write {
+        write_bytes(&card.join(path), text.as_bytes()).map_err(reason)?;
+    }
+    for path in &journal.unlink {
+        let _ = fs::remove_file(card.join(path));
+    }
+    let _ = fs::remove_dir_all(work);
+    log(&format!("  removed the original {}", journal.shown));
+    Ok(())
+}
+
+/// Whether two files hold the same bytes.
+fn same_file(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    if size(a).is_none() || size(a) != size(b) {
+        return false;
+    }
+    let (Ok(mut a), Ok(mut b)) = (fs::File::open(a), fs::File::open(b)) else { return false };
+    // Fill the whole buffer (or up to the end), so both sides read alike.
+    fn fill(f: &mut fs::File, buf: &mut [u8]) -> io::Result<usize> {
+        let mut n = 0;
+        while n < buf.len() {
+            match f.read(&mut buf[n..])? {
+                0 => break,
+                k => n += k,
+            }
+        }
+        Ok(n)
+    }
+    let (mut x, mut y) = (vec![0u8; 1 << 20], vec![0u8; 1 << 20]);
+    loop {
+        let (Ok(n), Ok(m)) = (fill(&mut a, &mut x), fill(&mut b, &mut y)) else { return false };
+        if n != m || x[..n] != y[..m] {
+            return false;
+        }
+        if n == 0 {
+            return true;
+        }
+    }
+}
+
+/// Finish conversions that a stopped run left in the computer's folder (see
+/// Journal); folders without a journal never touched the card and go. Runs
+/// before anything else.
+pub fn resume(card: &Path, log: &mut dyn FnMut(&str)) {
+    let Some(temp) = temp_root() else { return };
+    let Ok(entries) = fs::read_dir(temp.join(TEMP_FOLDER)) else { return };
+    for work in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
+        let Ok(text) = fs::read_to_string(work.join(JOURNAL)) else {
+            if work.join("files").is_dir() {
+                let _ = fs::remove_dir_all(&work); // stopped while converting; the original is on the card
+            }
+            continue;
+        };
+        let Ok(journal) = serde_json::from_str::<Journal>(&text) else {
+            log(&format!("could not read {TEMP_FOLDER}/{}/{JOURNAL}; its files are left there", name_of(&work)));
+            continue;
+        };
+        log(&format!("Finishing the conversion of {} that an earlier run left part-way", journal.shown));
+        let files_dir = work.join("files");
+        let dest = card.join(&journal.dest);
+        let needed: u64 = walk(&files_dir, &|_| true).iter().map(|f| size(f).unwrap_or(0)).sum::<u64>()
+            .saturating_sub(walk(&files_dir, &|_| true).iter().map(|f| size(&dest.join(rel(f, &files_dir))).unwrap_or(0)).sum())
+            .saturating_sub(journal.remove.iter().map(|p| size(&card.join(p)).unwrap_or(0)).sum());
+        if !has_room(card, needed) {
+            log(&format!("  {}; the files stay in the plugin's folder under \"{TEMP_FOLDER}/{}\"", no_space(needed), name_of(&work)));
+            continue;
+        }
+        if let Err(e) = finish(card, &work, &journal, log) {
+            log(&format!("  {e}"));
+        }
+    }
 }
 
 fn run_job(card: &Path, job: &Job, mode: Mode, temp: Option<&Path>, log: &mut dyn FnMut(&str)) -> Result<PathBuf, String> {
