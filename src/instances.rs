@@ -25,6 +25,8 @@ const SECTOR: u64 = 2352;
 const PREGAP: u64 = 150;
 const LIBCRYPT_SLOT: i64 = 99;
 const CARD_SLOT: i64 = 16;
+/// Files a cue-reader core reads from the game file's slots 101+ (disc 1).
+const CUE_FILE_SLOTS: usize = 19;
 /// Space a large write always leaves free on the SD card.
 const RESERVE: u64 = 256 << 20;
 const HELP_ENTRY: &str = "! How to add games (see README).json"; // package_release.py's placeholder
@@ -693,6 +695,18 @@ pub fn find_cores(card: &Path) -> Vec<Core> {
 }
 
 /// Slots the core declares in its data.json, or None.
+/// The core's disc menu as Core Settings names it ("Swap Discs" from 0.5.3,
+/// "Disc" before): the list setting on bridge address 0x50000044.
+pub fn disc_menu_name(card: &Path, core: &str) -> String {
+    let named = read_json(&card.join("Cores").join(core).join("interact.json")).and_then(|j| {
+        j.get("interact")?.get("variables")?.as_array()?.iter().find_map(|v| {
+            let address = v.get("address")?.as_str()?.to_ascii_lowercase();
+            (address == "0x50000044").then(|| v.get("name")?.as_str().map(str::to_string)).flatten()
+        })
+    });
+    named.unwrap_or_else(|| "Swap Discs".to_string())
+}
+
 fn declared_slots(card: &Path, core: &str) -> Option<Vec<(Option<i64>, Vec<String>)>> {
     let data = read_json(&card.join("Cores").join(core).join("data.json"))?;
     let slots = data.get("data")?.get("data_slots")?.as_array()?;
@@ -712,9 +726,8 @@ fn declared_slots(card: &Path, core: &str) -> Option<Vec<(Option<i64>, Vec<Strin
     )
 }
 
-/// Whether the core plays one .bin plus a .trk table per disc (--one-file-disc).
 /// Whether the core reads cues itself (--cue-mount: its launch slot takes
-/// .cue files). Its game files name only the cue.
+/// .cue files). Its game files name the cue and disc 1's files.
 pub fn is_cue_reader(card: &Path, core: &str) -> bool {
     declared_slots(card, core).map_or(false, |d| d.iter().any(|(id, ext)| *id == Some(0) && ext.iter().any(|e| e == "cue")))
 }
@@ -821,6 +834,9 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
     let libcrypt = declared.is_some() && ids.contains(&LIBCRYPT_SLOT);
     let one_file = is_one_file(card, core);
     let cue_reader = is_cue_reader(card, core);
+    // Cue-reader cores read .m3u playlists (up to four discs); slot 100 taking
+    // them means a game file can name one.
+    let playlist_slot = declared.iter().flatten().any(|(id, ext)| *id == Some(100) && ext.iter().any(|e| e == "m3u"));
     let common = card.join("Assets").join(platform).join("common");
     let out = card.join("Assets").join(platform).join(core);
     if !common.is_dir() {
@@ -866,9 +882,11 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
             }
         }
         if reason.is_none() && cue_reader {
-            // the game file names only the cue
+            // disc 1 boots from its slots, the rest by path
             track_count = files.iter().map(|f| f.1.len()).sum();
-            files = vec![];
+            if files.len() > CUE_FILE_SLOTS {
+                files = vec![];
+            }
         }
         if reason.is_none() && !one_file && !cue_reader && files.len() > max_tracks {
             reason = Some(format!("{} track files (core takes {max_tracks})", files.len()));
@@ -910,8 +928,57 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
         if cue_reader {
             let others: Vec<(u64, &Path)> = numbers[1..].iter().map(|n| (*n, parts[n].0.as_path())).collect();
             if !sibling_paths(&parts[&1].0, &others) {
-                log(&format!("{game}: the discs' names differ by more than their number, so each disc gets its own game file"));
-                let card = shared_card_name(stem(&name_of(&parts[&1].0)));
+                // The core can't find the other discs by name: a playlist lists them.
+                let stem1 = stem(&name_of(&parts[&1].0)).to_string();
+                let name = disc_n().replace_all(&stem1, "").trim().to_string();
+                let folders: Vec<Vec<String>> = numbers.iter().map(|n| segments(parts[n].0.parent().unwrap())).collect();
+                let mut depth = 0;
+                while folders.iter().all(|f| depth < f.len() && f[depth] == folders[0][depth]) {
+                    depth += 1;
+                }
+                let root: PathBuf = folders[0][..depth].iter().collect();
+                let m3u = root.join(format!("{name}.m3u"));
+                let shown = rel(&m3u, &common);
+                let card = shared_card_name(&stem1);
+                if numbers.len() <= 4 {
+                    let text: String = numbers.iter().map(|n| rel(&parts[n].0, &root) + "\n").collect();
+                    write_bytes(&m3u, text.as_bytes()).map_err(|e| format!("{shown}: {e}"))?;
+                }
+                if numbers.len() <= 4 && playlist_slot {
+                    let data_path = rel(&root, &common);
+                    let prefix = if data_path != "." { format!("{data_path}/") } else { String::new() };
+                    let shared = card.clone().filter(|_| shared_cards);
+                    let (cue1, files1, _, _) = parts[&1];
+                    let mut slots = vec![(100, format!("{name}.m3u"))];
+                    slots.extend(
+                        files1.iter().enumerate().map(|(k, (f, _))| (101 + k as i64, rel(&join(cue1.parent().unwrap(), f), &root))),
+                    );
+                    if let Some(shared) = &shared {
+                        for s in &mut slots {
+                            s.1 = format!("{prefix}{}", s.1);
+                        }
+                        slots.push((CARD_SLOT, shared.clone()));
+                        writer.discs.entry(shared.clone()).or_default().extend(numbers.iter().map(|n| stem(&name_of(&parts[n].0)).to_string()));
+                    }
+                    writer.write_instance(&name, if shared.is_some() { "" } else { &prefix }, &slots)?;
+                    for n in &numbers {
+                        let s = stem(&name_of(&parts[n].0)).to_string();
+                        if s != name {
+                            let _ = fs::remove_file(out.join(format!("{s}.json")));
+                        }
+                    }
+                    log(&format!("wrote {name}.json ({} discs, playlist {shown})", numbers.len()));
+                    written += 1;
+                    continue;
+                }
+                if numbers.len() <= 4 {
+                    log(&format!(
+                        "{game}: the discs' names differ by more than their number: wrote the playlist {shown} (pick it in the core's \
+                         file list to swap discs); each disc also gets its own game file"
+                    ));
+                } else {
+                    log(&format!("{game}: the discs' names differ by more than their number, so each disc gets its own game file"));
+                }
                 for n in &numbers {
                     let (cue, files, _, count) = parts[n];
                     writer.single(cue, files, *count, card.as_deref(), log)?;
@@ -938,7 +1005,8 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
         let cue1_name = name_of(cue1);
         let cue1_stem = stem(&cue1_name).to_string();
         let mut slots = vec![(100, in_root(cue1, &cue1_name))];
-        for n in &numbers {
+        // the cue reader finds the other discs by path
+        for n in &numbers[..if cue_reader { 1 } else { numbers.len() }] {
             let (cue, files, _, _) = parts[n];
             slots.extend(files.iter().enumerate().map(|(k, (name, _))| (100 * *n as i64 + 1 + k as i64, in_root(cue, name))));
         }
