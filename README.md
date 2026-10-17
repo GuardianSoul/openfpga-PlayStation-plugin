@@ -9,16 +9,18 @@ the SD card, the same way the core's `make_pocket_instances.py` script does:
   *Core Settings → Swap Discs*) and one shared memory card,
   `Saves/playstation/common/<game>.sav`, started from the newest per-disc card;
 - for cores from 0.5.3, which read the `.cue` themselves, game files that
-  name the cue and disc 1's files (the core finds the other discs and a
-  LibCrypt `.sbi` with the same name by itself), so merged and per-track
-  discs are used as they are. When a game's disc names differ by more than
-  their number (Final Fantasy IX's "(Disc 3) (v1.1)" and "(USA) (Disc 4)
-  (Rev 1)"), it writes a `.m3u` playlist of the discs next to them and the
-  game file names that;
+  name the cue and disc 1's files (the core finds the other discs by
+  itself), so merged and per-track discs are used as they are. From core
+  0.5.4, a LibCrypt `.sbi` with the cue's name goes in the game file too.
+  When a game's disc names differ by more than their number (Final Fantasy
+  IX's "(Disc 3) (v1.1)" and "(USA) (Disc 4) (Rev 1)"), it writes a `.m3u`
+  playlist of the discs next to them and the game file names that;
 - for one-file test cores, each disc's track table (`.trk`), joining
   per-track files into `<name> (one file).bin`;
 - for older cores, LibCrypt `.sbi` files next to a cue, and splitting merged
   `.bin` images into one file per track;
+- a `.cue` for a `.bin` that came without one (one data track; a game with
+  CD music needs its real `.cue`);
 - `.chd` images, extracted into a folder next to them with the same files
   `chdman extractcd` writes.
 

@@ -559,6 +559,80 @@ fn write_one_file(cue: &Path, files: &CueFiles, sbi: Option<&Path>) -> Result<(P
     Ok((image, table, tracks.len()))
 }
 
+// ---- .bin files without a cue -------------------------------------------------
+
+/// The cue written for a .bin that came without one: one data track.
+fn lone_bin_cue(bin_name: &str) -> String {
+    format!("FILE \"{bin_name}\" BINARY\n  TRACK 01 MODE2/2352\n    INDEX 01 00:00:00\n")
+}
+
+/// .bin files under common that no cue in their folder names and that have
+/// no <name>.cue, with the reason one is skipped: a "(Track n)" file is part
+/// of a disc whose cue is missing.
+fn lone_bins(common: &Path) -> Vec<(PathBuf, Option<&'static str>)> {
+    let mut found = vec![];
+    for bin in walk(common, &|n| has_ext(n, ".bin")) {
+        let folder = bin.parent().unwrap();
+        let name = name_of(&bin);
+        if name.ends_with(" (one file).bin") || is_file(&folder.join(format!("{}.cue", stem(&name)))) {
+            continue;
+        }
+        let (mut named, mut broken) = (vec![], false);
+        for entry in fs::read_dir(folder).into_iter().flatten().flatten() {
+            let cue = entry.path();
+            let cue_name = name_of(&cue);
+            if !has_ext(&cue_name, ".cue") || cue_name.starts_with("._") || !is_file(&cue) {
+                continue;
+            }
+            match parse_cue(&cue) {
+                Ok(files) => named.extend(files.iter().map(|(f, _)| join(folder, &f.replace('\\', "/")))),
+                Err(_) => broken = true,
+            }
+        }
+        if broken || named.contains(&bin) {
+            continue;
+        }
+        let reason = if regex!(r"(?i)\(Track \d+\)").is_match(stem(&name)) {
+            Some("a track file whose .cue is missing")
+        } else if size(&bin).unwrap_or(0) % SECTOR != 0 {
+            Some("not whole 2352-byte sectors")
+        } else {
+            None
+        };
+        found.push((bin, reason));
+    }
+    found
+}
+
+/// Give each lone .bin a one-track <name>.cue so it gets a game file.
+/// Returns how many were skipped. The write keeps RESERVE free.
+fn write_lone_cues(common: &Path, log: &mut dyn FnMut(&str)) -> usize {
+    let mut skipped = 0;
+    for (bin, reason) in lone_bins(common) {
+        let shown = rel(&bin, common);
+        if let Some(reason) = reason {
+            log(&format!("skip {shown}: {reason}"));
+            skipped += 1;
+            continue;
+        }
+        let name = name_of(&bin);
+        let cue = bin.with_file_name(format!("{}.cue", stem(&name)));
+        let text = lone_bin_cue(&name);
+        match write_parts(&cue, Some(text.len() as u64), &mut |out| out.write_all(text.as_bytes())) {
+            Ok(()) => log(&format!("wrote {} (one data track; a game with CD music needs its own .cue)", rel(&cue, common))),
+            Err(e) if is_no_space(&e) => {
+                log(&format!("skip {shown}: not enough free space for its .cue"));
+                skipped += 1;
+            }
+            Err(e) => {
+                log(&format!("skip {shown}: {e}"));
+                skipped += 1;
+            }
+        }
+    }
+    skipped
+}
+
 // ---- CHD images ------------------------------------------------------------------
 
 /// Report .chd files under common that have no extracted copy next to them
@@ -793,7 +867,9 @@ impl Writer<'_> {
         } else {
             None
         };
-        if let (Some(sbi), false) = (&sbi, self.one_file || self.cue_reader) {
+        // Cue-reader cores read a cue's .sbi by its path, which a game JSON's
+        // cue doesn't have on the Pocket: they take it from slot 99 instead.
+        if let (Some(sbi), true) = (&sbi, if self.cue_reader { self.libcrypt } else { !self.one_file }) {
             slots.push((LIBCRYPT_SLOT, sbi.clone()));
         }
         let mut prefix = if data_path != "." { format!("{data_path}/") } else { String::new() };
@@ -848,6 +924,7 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
     }
     let discs_declared = 1 + (2..10).filter(|n| disc_tracks[n] > 0).count();
     let (mut written, mut skipped) = (0, report_chds(&common, log));
+    skipped += write_lone_cues(&common, log);
     let mut writer = Writer { out: &out, common: &common, shared_cards, libcrypt, one_file, cue_reader, discs: BTreeMap::new() };
     let mut games: BTreeMap<String, BTreeMap<u64, Vec<Part>>> = BTreeMap::new();
     for cue in walk(&common, &|n| has_ext(n, ".cue")) {
@@ -1011,7 +1088,15 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
             let (cue, files, _, _) = parts[n];
             slots.extend(files.iter().enumerate().map(|(k, (name, _))| (100 * *n as i64 + 1 + k as i64, in_root(cue, name))));
         }
-        if let Some(sbi) = if libcrypt && !cue_reader { find_sbi(cue1) } else { None } {
+        let sbi = if !libcrypt {
+            None
+        } else if cue_reader {
+            let same = format!("{cue1_stem}.sbi");
+            is_file(&cue1.parent().unwrap().join(&same)).then_some(same)
+        } else {
+            find_sbi(cue1)
+        };
+        if let Some(sbi) = sbi {
             slots.push((LIBCRYPT_SLOT, in_root(cue1, &sbi)));
         }
         let data_path = rel(&root, &common);
