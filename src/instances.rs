@@ -122,8 +122,10 @@ fn walk(folder: &Path, test: &dyn Fn(&str) -> bool) -> Vec<PathBuf> {
     found
 }
 
+/// Compared as bytes: a name with non-ASCII letters near its end ("ポケモン.gb")
+/// has no char boundary there, and slicing the str would stop the plugin.
 fn has_ext(name: &str, ext: &str) -> bool {
-    name.len() > ext.len() && name[name.len() - ext.len()..].eq_ignore_ascii_case(ext)
+    name.len() > ext.len() && name.as_bytes()[name.len() - ext.len()..].eq_ignore_ascii_case(ext.as_bytes())
 }
 
 /// A cue's FILE names are relative to its folder.
@@ -784,6 +786,39 @@ fn shared_card_name(stem: &str) -> Option<String> {
     disc_tag(stem).map(|(_, name)| format!("{}.sav", name.trim()))
 }
 
+/// Disc numbers of the cues of one folder that no disc tag groups ("disc1",
+/// "disc2"; "1", "2"): each name's last number, the rest of the names equal,
+/// the numbers 1..n. None when the names point to different games ("Tekken
+/// 2" with "Tekken 3", "Crash" with "Spyro").
+fn folder_discs(stems: &[String]) -> Option<Vec<u64>> {
+    let mut keys = std::collections::HashSet::new();
+    let mut numbers = vec![];
+    for stem in stems {
+        let s = release().replace_all(stem, "").to_lowercase();
+        let last = regex!(r"[0-9]+").find_iter(&s).last()?;
+        numbers.push(last.as_str().parse::<u64>().ok()?);
+        let rest = format!("{}{}", &s[..last.start()], &s[last.end()..]);
+        keys.insert(rest.chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).collect::<String>());
+    }
+    let mut sorted = numbers.clone();
+    sorted.sort();
+    (keys.len() == 1 && sorted.iter().enumerate().all(|(i, &n)| n == i as u64 + 1)).then_some(numbers)
+}
+
+/// A name-grouped game's file name: disc 1's name without its disc tag,
+/// keeping only the tags in parentheses that every disc has ("Gran Turismo 2
+/// (USA) (Disc 1) (Arcade Mode)" with "... (Disc 2) (Simulation Mode)" ->
+/// "Gran Turismo 2 (USA)").
+fn group_title(stems: &[String]) -> String {
+    let names: Vec<String> = stems.iter().map(|s| disc_tag(s).map(|(_, n)| n).unwrap_or_else(|| s.clone())).collect();
+    let tags: Vec<Vec<String>> = names.iter().map(|n| release().find_iter(n).map(|m| m.as_str().trim().to_string()).collect()).collect();
+    if tags.iter().all(|k| *k == tags[0]) {
+        return names[0].trim().to_string();
+    }
+    let kept: String = tags[0].iter().filter(|x| tags.iter().all(|k| k.contains(x))).map(|x| format!(" {x}")).collect();
+    format!("{}{kept}", release().replace_all(&names[0], "").trim()).trim().to_string()
+}
+
 /// A multi-disc game's shared card: from the first disc whose name has a disc tag.
 fn group_card<'a>(stems: impl Iterator<Item = &'a str>) -> Option<String> {
     stems.filter_map(shared_card_name).next()
@@ -1140,6 +1175,29 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
         }
     }
     let untagged_first: std::collections::HashSet<String> = later.difference(&first).cloned().collect();
+    // A subfolder holding only 2-4 cues that no disc tag groups, named as one
+    // game's discs, is that game ("Riven/disc1.cue", "Riven/disc2.cue"),
+    // named after the folder.
+    let mut by_folder: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    for cue in walk(&common, &|n| has_ext(n, ".cue")) {
+        let folder = cue.parent().unwrap().to_path_buf();
+        if folder != common {
+            by_folder.entry(folder).or_default().push(cue);
+        }
+    }
+    let mut folder_disc: HashMap<PathBuf, (u64, String)> = HashMap::new();
+    for (folder, cues) in &by_folder {
+        let stems: Vec<String> = cues.iter().map(|c| stem(&name_of(c)).to_string()).collect();
+        let tagged = stems.iter().any(|s| disc_tag(s).is_some() || untagged_first.contains(release().replace_all(s, "").trim()));
+        if !(2..=4).contains(&cues.len()) || tagged {
+            continue;
+        }
+        if let Some(numbers) = folder_discs(&stems) {
+            for (c, n) in cues.iter().zip(numbers) {
+                folder_disc.insert(c.clone(), (n, rel(folder, &common) + "/")); // never a title's key
+            }
+        }
+    }
     for cue in walk(&common, &|n| has_ext(n, ".cue")) {
         let folder = cue.parent().unwrap().to_path_buf();
         let cue_name = name_of(&cue);
@@ -1200,6 +1258,10 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
         }
         let title = release().replace_all(&cue_stem, "").trim().to_string();
         let tag = disc_tag(&cue_stem).or_else(|| untagged_first.contains(&title).then(|| (1, cue_stem.clone())));
+        if let Some((n, game)) = folder_disc.get(&cue).filter(|_| discs_declared > 1) {
+            games.entry(game.clone()).or_default().entry(*n).or_default().push((cue.clone(), files, vec![], track_count));
+            continue;
+        }
         if let Some((n, name)) = tag {
             if discs_declared > 1 {
                 let game = release().replace_all(&name, "").trim().to_string();
@@ -1218,17 +1280,39 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
         let parts: BTreeMap<u64, &Part> =
             found.iter().map(|(&n, cands)| (n, cands.iter().find(|c| c.2 == first_tags).unwrap_or(&cands[0]))).collect();
         let numbers: Vec<u64> = parts.keys().copied().collect();
+        let by_folder = game.ends_with('/');
+        let label = if by_folder { game.trim_end_matches('/').rsplit('/').next().unwrap().to_string() } else { game.clone() };
         if numbers.iter().enumerate().any(|(i, &n)| n != i as u64 + 1) || numbers.len() > discs_declared {
-            log(&format!("skip {game}: {}", disc_gap(&numbers, discs_declared, platform)));
+            log(&format!("skip {label}: {}", disc_gap(&numbers, discs_declared, platform)));
             skipped += 1;
             continue;
         }
+        // The discs of one game in folders of different folders ("A/X (Disc
+        // 1)/", "B/X (Disc 2)/"): grouped by their names all the same.
+        let parents = |up: usize| {
+            numbers.iter().map(|n| parts[n].0.ancestors().nth(1 + up).map(|p| p.to_path_buf())).collect::<std::collections::HashSet<_>>().len()
+        };
+        if parents(1) > 1 && parents(0) > 1 {
+            let shown: Vec<String> = numbers.iter().map(|n| rel(parts[n].0.parent().unwrap(), &common)).collect();
+            log(&format!("warning: {label}: its discs are in different folders ({}); put them in one folder", shown.join(", ")));
+        }
+        if by_folder {
+            log(&format!("{label}: {} discs in one folder, grouped as one game", numbers.len()));
+        }
+        // A folder's discs: the game file and shared card take the folder's name.
+        let stems: Vec<String> = numbers.iter().map(|n| stem(&name_of(&parts[n].0)).to_string()).collect();
+        // Before group_title(), disc 1's name: its game file is replaced.
+        let old_title = (!by_folder).then(|| disc_tag(&stems[0]).map(|(_, n)| n.trim().to_string()).unwrap_or_else(|| stems[0].clone()));
+        let new_title = if by_folder { label.clone() } else { group_title(&stems) };
+        let title = |_: &str| new_title.clone();
+        let mut old_names = stems.clone();
+        old_names.extend(old_title.clone().filter(|t| *t != new_title));
+        let card_of = if by_folder { Some(format!("{label}.sav")) } else { group_card(stems.iter().map(|s| s.as_str())) };
         if cue_reader {
             let others: Vec<(u64, &Path)> = numbers[1..].iter().map(|n| (*n, parts[n].0.as_path())).collect();
             if !sibling_paths(&parts[&1].0, &others) {
                 // The core can't find the other discs by name: a playlist lists them.
-                let stem1 = stem(&name_of(&parts[&1].0)).to_string();
-                let name = disc_tag(&stem1).map(|(_, n)| n.trim().to_string()).unwrap_or_else(|| stem1.clone());
+                let name = title(stem(&name_of(&parts[&1].0)));
                 let folders: Vec<Vec<String>> = numbers.iter().map(|n| segments(parts[n].0.parent().unwrap())).collect();
                 let mut depth = 0;
                 while folders.iter().all(|f| depth < f.len() && f[depth] == folders[0][depth]) {
@@ -1237,7 +1321,7 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
                 let root: PathBuf = folders[0][..depth].iter().collect();
                 let m3u = root.join(format!("{name}.m3u"));
                 let shown = rel(&m3u, &common);
-                let card = group_card(numbers.iter().map(|n| stem(&name_of(&parts[n].0)).to_string()).collect::<Vec<_>>().iter().map(|s| s.as_str()));
+                let card = card_of.clone();
                 if numbers.len() <= 4 {
                     let text: String = numbers.iter().map(|n| rel(&parts[n].0, &root) + "\n").collect();
                     write_bytes(&m3u, text.as_bytes()).map_err(|e| format!("{shown}: {e}"))?;
@@ -1262,10 +1346,14 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
                         writer.discs.entry(shared.clone()).or_default().extend(numbers.iter().map(|n| stem(&name_of(&parts[n].0)).to_string()));
                     }
                     writer.write_instance(&name, if shared.is_some() { "" } else { &prefix }, &slots)?;
-                    for n in &numbers {
-                        let s = stem(&name_of(&parts[n].0)).to_string();
-                        if s != name {
-                            let _ = fs::remove_file(out.join(format!("{s}.json")));
+                    for s in old_names.iter().filter(|s| **s != name) {
+                        let _ = fs::remove_file(out.join(format!("{s}.json")));
+                    }
+                    if let Some(old) = old_title.as_ref().filter(|t| **t != name) {
+                        // the playlist under the old name, if it is ours
+                        let old_m3u = root.join(format!("{old}.m3u"));
+                        if is_file(&old_m3u) && fs::read(&old_m3u).ok() == fs::read(&m3u).ok() {
+                            let _ = fs::remove_file(&old_m3u);
                         }
                     }
                     log(&format!("wrote {name}.json ({} discs, playlist {shown})", numbers.len()));
@@ -1274,11 +1362,11 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
                 }
                 if numbers.len() <= 4 {
                     log(&format!(
-                        "{game}: the discs' names differ by more than their number: wrote the playlist {shown} (pick it in the core's \
+                        "{label}: the discs' names differ by more than their number: wrote the playlist {shown} (pick it in the core's \
                          file list to swap discs); each disc also gets its own game file"
                     ));
                 } else {
-                    log(&format!("{game}: the discs' names differ by more than their number, so each disc gets its own game file"));
+                    log(&format!("{label}: the discs' names differ by more than their number, so each disc gets its own game file"));
                 }
                 for n in &numbers {
                     let (cue, files, _, count) = parts[n];
@@ -1290,7 +1378,7 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
         }
         let too_long = if one_file || cue_reader { None } else { numbers[1..].iter().find(|&&n| parts[&n].1.len() > disc_tracks[&(n as i64)]) };
         if let Some(n) = too_long {
-            log(&format!("skip {game}: disc {n} has more track files than the core declares: update the core to the latest version"));
+            log(&format!("skip {label}: disc {n} has more track files than the core declares: update the core to the latest version"));
             skipped += 1;
             continue;
         }
@@ -1331,8 +1419,7 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
         }
         let data_path = rel(&root, &common);
         let mut prefix = if data_path != "." { format!("{data_path}/") } else { String::new() };
-        let stems: Vec<String> = numbers.iter().map(|n| stem(&name_of(&parts[n].0)).to_string()).collect();
-        if let Some(shared) = shared_cards.then(|| group_card(stems.iter().map(|s| s.as_str()))).flatten() {
+        if let Some(shared) = card_of.clone().filter(|_| shared_cards) {
             // the same shared card as the per-disc files would use
             for s in &mut slots {
                 s.1 = format!("{prefix}{}", s.1);
@@ -1343,14 +1430,11 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
             prefix = String::new();
         }
         // Named after disc 1 without its disc tag ("Final Fantasy VII (USA).json").
-        let name = disc_tag(&cue1_stem).map(|(_, n)| n.trim().to_string()).unwrap_or_else(|| cue1_stem.clone());
+        let name = title(&cue1_stem);
         writer.write_instance(&name, &prefix, &slots)?;
-        for n in &numbers {
-            // per-disc files from earlier runs
-            let s = stem(&name_of(&parts[n].0)).to_string();
-            if s != name {
-                let _ = fs::remove_file(out.join(format!("{s}.json")));
-            }
+        for s in old_names.iter().filter(|s| **s != name) {
+            // per-disc files and older names from earlier runs
+            let _ = fs::remove_file(out.join(format!("{s}.json")));
         }
         log(&format!("wrote {name}.json ({} disc{})", numbers.len(), if numbers.len() > 1 { "s" } else { "" }));
         written += 1;

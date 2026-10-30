@@ -133,6 +133,11 @@ fn run(core: &str, mode: Option<Mode>) -> PluginMessage {
 
 #[plugin_fn]
 pub fn start() -> FnResult<PluginMessage> {
+    // A panic stops the plugin without an Exit, so the host keeps waiting:
+    // at least say so in the log.
+    std::panic::set_hook(Box::new(|info| {
+        println(&format!("The plugin stopped with an error ({info}). You can close this window; please report this line."));
+    }));
     println("PlayStation game files");
     let (cores, others): (Vec<_>, Vec<_>) = instances::find_cores(Path::new(CARD)).into_iter().partition(|c| c.supported);
     let others: Vec<String> = others.into_iter().map(|c| c.id).collect();
