@@ -1059,6 +1059,38 @@ fn nothing_made(written: usize, skipped: usize, platform: &str) -> Option<String
     }
 }
 
+/// Two whole releases of one game ("X (USA) (Disc 1/2)" with "X (Europe)
+/// (Disc 1/2)") are two games: one per disc 1 with its own release tags,
+/// named "X (USA)" and "X (Europe)". Each takes the discs with its tags, else
+/// every candidate (the first is used).
+fn split_releases(games: BTreeMap<String, BTreeMap<u64, Vec<Part>>>) -> BTreeMap<String, BTreeMap<u64, Vec<Part>>> {
+    let mut out = BTreeMap::new();
+    for (game, found) in games {
+        let mut releases: Vec<Vec<String>> = vec![];
+        for c in found.get(&1).into_iter().flatten() {
+            if !releases.contains(&c.2) {
+                releases.push(c.2.clone());
+            }
+        }
+        if releases.len() < 2 {
+            out.insert(game, found);
+            continue;
+        }
+        for tags in releases {
+            let discs = found
+                .iter()
+                .map(|(&n, cands)| {
+                    let same: Vec<Part> = cands.iter().filter(|c| c.2 == tags).cloned().collect();
+                    (n, if same.is_empty() { cands.clone() } else { same })
+                })
+                .collect();
+            let shown: Vec<&str> = tags.iter().map(|t| t.trim()).collect();
+            out.insert(format!("{game} {}", shown.join(" ")), discs);
+        }
+    }
+    out
+}
+
 /// What a game file needs to know about the core, and the shared cards so far.
 struct Writer<'a> {
     out: &'a Path,
@@ -1273,6 +1305,7 @@ pub fn make_instances(card: &Path, core: &str, platform: &str, log: &mut dyn FnM
         writer.single(&cue, &files, track_count, None, log)?;
         written += 1;
     }
+    let games = split_releases(games);
     for (game, found) in &games {
         let first_tags = found.get(&1).map(|c| c[0].2.clone()).unwrap_or_default();
         // Two releases of the same disc: keep the one whose release tags

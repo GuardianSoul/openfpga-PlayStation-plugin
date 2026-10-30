@@ -77,8 +77,8 @@ about it:
   does when it starts: one of the names the core looks for (such as
   `scph5501.bin`), exactly 512 KB, and a real PlayStation BIOS (with its
   "System ROM Version" line). It reports each one as OK, the wrong size or
-  not a BIOS. With no usable BIOS there, it looks for one elsewhere on the
-  card (under another name, in another core's folder, in the card's root)
+  not a BIOS. With no usable BIOS there, it looks for one under another
+  name there, in `Assets/psx/common/` and in the core's own Assets folder,
   and says where to copy it and what to call it. A BIOS in
   `Assets/playstation/common/` is never mistaken for a disc.
 

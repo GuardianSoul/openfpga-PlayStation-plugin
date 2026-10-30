@@ -138,7 +138,7 @@ pub fn start() -> FnResult<PluginMessage> {
     std::panic::set_hook(Box::new(|info| {
         println(&format!("The plugin stopped with an error ({info}). You can close this window; please report this line."));
     }));
-    println("PlayStation game files");
+    println(&format!("PlayStation game files {}", env!("CARGO_PKG_VERSION")));
     let (cores, others): (Vec<_>, Vec<_>) = instances::find_cores(Path::new(CARD)).into_iter().partition(|c| c.supported);
     let others: Vec<String> = others.into_iter().map(|c| c.id).collect();
     if !others.is_empty() && !cores.is_empty() {
