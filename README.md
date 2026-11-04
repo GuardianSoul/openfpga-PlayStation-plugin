@@ -51,7 +51,9 @@ replace them, or skip them. A full SD card corrupts easily, so:
 ## What it checks
 
 Every run reports what it finds, and each problem comes with what to do
-about it:
+about it. The window keeps it short (a few example lines per kind of
+problem); the full report, with every game file and every skipped folder,
+is saved next to the game files as `Game files report.txt`:
 
 - **The core.** It makes game files only for the GuardianSoul.PlayStation
   core. Another developer's PlayStation core on the card is not listed; if
