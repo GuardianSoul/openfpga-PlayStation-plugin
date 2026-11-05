@@ -158,6 +158,9 @@ fn run(core: &str, mode: Option<Mode>) -> PluginMessage {
     // for every line).
     let verbose = config::get("verbose").ok().flatten().is_some();
     let (mut made, mut mark, mut details) = (0, PROGRESS, 0);
+    const EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+    let mut last = std::time::Instant::now();
+    let mut seeded = 0;
     let mut hidden: Vec<String> = Vec::new();
     if !verbose {
         if let Ok(mut path) = REPORT_PATH.lock() {
@@ -171,12 +174,23 @@ fn run(core: &str, mode: Option<Mode>) -> PluginMessage {
         if line.starts_with("wrote ") && line.contains(".json (") {
             note(line);
             made += 1;
-            if made == mark {
+            // Also every 10 seconds: a slow SD card takes a while, and a
+            // window with no new line looks stuck.
+            if made == mark || last.elapsed() >= EVERY {
                 println(&format!("{made} game files so far ..."));
-                mark *= 2;
+                last = std::time::Instant::now();
+                while mark <= made {
+                    mark *= 2;
+                }
             }
         } else if line.starts_with("shared card ") {
+            // Starting each shared card from a disc's save takes a while too.
             note(line);
+            seeded += 1;
+            if last.elapsed() >= EVERY {
+                println(&format!("{seeded} shared memory cards so far ..."));
+                last = std::time::Instant::now();
+            }
         } else if line.starts_with(|c: char| c.is_ascii_digit()) && line.contains(" game files in ") {
             // the summary
             if !hidden.is_empty() {
